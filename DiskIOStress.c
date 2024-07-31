@@ -29,7 +29,10 @@ E-mail: xinyu0123@gmail.com
 #define MAX_THREAD_NUM      256
 #define MAX_LOOP_NUM        10000000
 #define MAX_TRUNK_SIZE      (20 * SIZE_1M)
-#define MAX_TEST_TIME       (86400 * 7)
+#define ONE_MININUTE_IN_SEC 60
+#define ONE_HOUR_IN_SEC     (60 * ONE_MININUTE_IN_SEC)
+#define ONE_DAY_IN_SEC      (24 * ONE_HOUR_IN_SEC)
+#define MAX_TEST_TIME       (4 * ONE_HOUR_IN_SEC) //(86400 * 7)
 #define MAX_STREAM_NUM      128
 #define MAX_SECTOR_COUNT    2048
 
@@ -154,7 +157,7 @@ enum
 #define DISK_IO_ENGINE      IO_ENGINE_NVME
 
 #define SUPPORT_BLKDISCARD  TRUE
-#define SUPPORT_BLKFLUSH    FALSE
+#define SUPPORT_BLKFLUSH    TRUE
 #define SUPPORT_DATA_TAG    TRUE
 #define SUPPORT_RE_READ     TRUE
 #define SUPPORT_DATA_VERIFY TRUE
@@ -303,6 +306,7 @@ int     disk_reset(int fd);
 
 int     nvme_read (int fd, char* buf, U64 lba, U32 len);
 int     nvme_write(int fd, char* buf, U64 lba, U32 len, U32 write_hint);
+int     nvme_writeuncor(int fd, U64 lba, U32 len);
 int     nvme_flush(int fd, int nsid);
 int     nvme_trim(int fd, U64 lba, U32 len, U32 nsid);
 int     nvme_reset(int fd);
@@ -1579,6 +1583,18 @@ int disk_write(int fd, char* buf, U64 lba, U32 len, U32 write_hint)
     return FALSE;
 }
 
+int disk_writeuncor(int fd, U64 lba, U32 len)
+{
+    #if   DISK_IO_ENGINE == IO_ENGINE_NVME
+        if (nvme_writeuncor(fd, lba, len)) return TRUE;
+    #else
+        printf("read not supported for IO engine:%d\n", DISK_IO_ENGINE);
+        exit(1);
+    #endif
+
+    return FALSE;
+}
+
 int disk_flush(int fd)
 {
     #if   DISK_IO_ENGINE == IO_ENGINE_NVME
@@ -1662,6 +1678,26 @@ int nvme_write(int fd, char* buf, U64 lba, U32 len, U32 write_hint)
         io.control |= NVME_RW_DTYPE_STREAMS;
         io.dsmgmt  |= (write_hint << 16);
     }
+
+    ret = ioctl(fd, NVME_IOCTL_SUBMIT_IO, (struct nvme_passthru_cmd*)&io);
+
+    if (ret != 0)
+    {
+        return -1;
+    }
+
+    return 0;
+}
+
+int nvme_writeuncor(int fd, U64 lba, U32 len)
+{
+    int ret;
+    struct nvme_user_io io;
+
+    memset(&io, 0x00, sizeof(io));
+    io.opcode  = nvme_cmd_write_uncor;
+    io.slba    = lba;
+    io.nblocks = len - 1;
 
     ret = ioctl(fd, NVME_IOCTL_SUBMIT_IO, (struct nvme_passthru_cmd*)&io);
 
