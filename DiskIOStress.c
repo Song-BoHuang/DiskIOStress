@@ -107,6 +107,7 @@ enum
     WORKLOAD_SEQ_WRRC,
     WORKLOAD_SEQ_W1RCN,
     WORKLOAD_RAND_WRC,
+    WORKLOAD_RAND_WUR,
     WORKLOAD_MAX
 };
 
@@ -145,6 +146,7 @@ enum
 {
     OPS_WRITE = 0,
     OPS_READ,
+    OPS_WRITE_UNCOR,
     OPS_NULL,
 };
 
@@ -153,7 +155,7 @@ enum
 #define IO_ENGINE_NVME      2
 
 #define DEFAULT_PATTERN     PATTERN_RANDOM
-#define DEFAULT_WORKLOAD    WORKLOAD_RAND_WRC
+#define DEFAULT_WORKLOAD    WORKLOAD_RAND_WUR
 #define DISK_IO_ENGINE      IO_ENGINE_NVME
 
 #define SUPPORT_BLKDISCARD  TRUE
@@ -294,12 +296,16 @@ int     wl_seq_wrc(ThreadInfo_t* pThrInfo);
 int     wl_seq_wrrc(ThreadInfo_t* pThrInfo);
 int     wl_seq_w1rcn(ThreadInfo_t* pThrInfo);
 int     wl_rand_wrc(ThreadInfo_t* pThrInfo);
+int     wl_rand_wur(ThreadInfo_t* pThrInfo);
 
 int     thread_write(ThreadInfo_t* pThrInfo, U64 lba, U32 len, U32 write_hint);
 int     thread_read(ThreadInfo_t* pThrInfo, U64 lba, U32 len);
+int     thread_writeuncor(ThreadInfo_t* pThrInfo, U64 lba, U32 len);
+int     thread_readuncor(ThreadInfo_t* pThrInfo, U64 lba, U32 len);
 
 int     disk_read (int fd, char* buf, U64 lba, U32 len);
 int     disk_write(int fd, char* buf, U64 lba, U32 len, U32 write_hint);
+int     disk_writeuncor(int fd, U64 lba, U32 len);
 int     disk_flush(int fd);
 int     disk_trim (int fd, U64 lba, U32 len);
 int     disk_reset(int fd);
@@ -373,6 +379,7 @@ int (*gWorkloadList[WORKLOAD_MAX])(ThreadInfo_t* pThrInfo) =
     wl_seq_wrrc,
     wl_seq_w1rcn,
     wl_rand_wrc,
+    wl_rand_wur,
 };
 
 /*===================================================
@@ -942,6 +949,153 @@ wl_rand_wrc_halt:
 
             if (gDiskIOInfo.status) return 1;
             else if (gDiskIOInfo.otf_flag == OTF_HALT) goto wl_rand_wrc_halt;
+        }
+
+    #if SUPPORT_BLKDISCARD == TRUE
+        disk_trim(pThrInfo->fd, start_block, end_block - start_block);
+    #endif
+    }
+
+    return 0;
+}
+
+/*===================================================
+| Workload: Random Write UNC Read
+===================================================*/
+int wl_rand_wur(ThreadInfo_t* pThrInfo)
+{
+    U64 cmds;
+    U64 curr_block;
+    U64 start_block;
+    U64 end_block;
+    U64 cmd_count;
+    U32 write_hint = 0;
+
+    for (pThrInfo->cr_loop = 0; pThrInfo->cr_loop < pThrInfo->nr_loop; pThrInfo->cr_loop++)
+    {
+        generate_pattern(pThrInfo->bufW, SIZE_1M, pThrInfo->pattern_type);
+        pThrInfo->block_count = (rand() % gDiskIOInfo.max_sector) + 1;
+        start_block = pThrInfo->block_start + (rand() % (pThrInfo->block_end - pThrInfo->block_start));
+
+        do
+        {
+            end_block = start_block + (rand() % pThrInfo->block_per_trunk) + 1;
+        } while((start_block + pThrInfo->block_count) > end_block);
+
+        end_block = (end_block > pThrInfo->block_end) ? pThrInfo->block_end: end_block;
+        cmd_count = (end_block - start_block) / pThrInfo->block_count;
+
+        // === Sequentail Write UNC ============================
+        curr_block    = start_block;
+        cmds          = 0;
+        pThrInfo->ops = OPS_WRITE_UNCOR;
+        while (cmds++ < cmd_count)
+        {
+            generate_tag(pThrInfo->bufW, pThrInfo, curr_block);
+            thread_writeuncor(pThrInfo, curr_block, pThrInfo->block_count);
+
+            curr_block += pThrInfo->block_count;
+            if (gDiskIOInfo.status) return 1;
+            else if (gDiskIOInfo.otf_flag == OTF_HALT)
+            {
+                cmd_count = cmds;
+                break;
+            }
+        }
+
+        // === Sequentail Write ================================
+        curr_block    = start_block;
+        cmds          = 0;
+        pThrInfo->ops = OPS_WRITE;
+        while (cmds++ < cmd_count)
+        {
+            generate_tag(pThrInfo->bufW, pThrInfo, curr_block);
+            thread_write(pThrInfo, curr_block, pThrInfo->block_count, write_hint);
+
+            curr_block += pThrInfo->block_count;
+            if (gDiskIOInfo.status) return 1;
+            else if (gDiskIOInfo.otf_flag == OTF_HALT)
+            {
+                cmd_count = cmds;
+                break;
+            }
+        }
+
+        // === Random Write ================================
+        cmds          = 0;
+        pThrInfo->ops = OPS_WRITE;
+        while (cmds++ < cmd_count)
+        {
+            curr_block = start_block + (rand() % cmd_count) * pThrInfo->block_count;
+            generate_tag(pThrInfo->bufW, pThrInfo, curr_block);
+            thread_write(pThrInfo, curr_block, pThrInfo->block_count, write_hint);
+
+            if (gDiskIOInfo.status) return 1;
+            else if (gDiskIOInfo.otf_flag == OTF_HALT) break;
+        }
+
+        // === Random Write UNC ============================
+        // cmds          = 0;
+        // pThrInfo->ops = OPS_WRITE_UNCOR;
+        // while (cmds++ < cmd_count)
+        // {
+        //     curr_block = start_block + (rand() % cmd_count) * pThrInfo->block_count;
+        //     generate_tag(pThrInfo->bufW, pThrInfo, curr_block);
+        //     thread_writeuncor(pThrInfo, curr_block, pThrInfo->block_count);
+
+        //     if (gDiskIOInfo.status) return 1;
+        //     else if (gDiskIOInfo.otf_flag == OTF_HALT) break;
+        // }
+
+    #if DISK_IO_ENGINE != IO_ENGINE_NVME
+        ioctl(pThrInfo->fd, BLKFLSBUF, 0);
+    #endif
+
+    #if (SUPPORT_BLKFLUSH == TRUE)
+        if ((rand() % 100) == 0)
+        {
+            disk_flush(pThrInfo->fd);
+        }
+    #endif
+
+wl_rand_wur_halt:
+
+    #if SUPPORT_OTF_FW_UPD == TRUE
+        if (gDiskIOInfo.otf_flag == OTF_HALT)
+        {
+            pThrInfo->status = THREAD_STATUS_PAUSE;
+
+            while (gDiskIOInfo.otf_flag == OTF_HALT && gDiskIOInfo.status == STATUS_RUNNING) usleep(10000);
+
+            pThrInfo->status = THREAD_STATUS_RUNNING;
+        }
+    #endif
+
+        // === Sequentail read verfiy ===============================
+        curr_block    = start_block;
+        cmds          = 0;
+        pThrInfo->ops = OPS_READ;
+        while (cmds++ < cmd_count)
+        {
+            generate_tag(pThrInfo->bufW, pThrInfo, curr_block);
+            thread_readuncor(pThrInfo, curr_block, pThrInfo->block_count);
+
+            curr_block += pThrInfo->block_count;
+            if (gDiskIOInfo.status) return 1;
+            else if (gDiskIOInfo.otf_flag == OTF_HALT) goto wl_rand_wur_halt;
+        }
+
+        // === Random read verfiy ===============================
+        cmds          = 0;
+        pThrInfo->ops = OPS_READ;
+        while (cmds++ < cmd_count)
+        {
+            curr_block = start_block + (rand() % cmd_count) * pThrInfo->block_count;
+            generate_tag(pThrInfo->bufW, pThrInfo, curr_block);
+            thread_readuncor(pThrInfo, curr_block, pThrInfo->block_count);
+
+            if (gDiskIOInfo.status) return 1;
+            else if (gDiskIOInfo.otf_flag == OTF_HALT) goto wl_rand_wur_halt;
         }
 
     #if SUPPORT_BLKDISCARD == TRUE
@@ -1555,6 +1709,35 @@ int thread_read(ThreadInfo_t* pThrInfo, U64 lba, U32 len)
     return 0;
 }
 
+int thread_writeuncor(ThreadInfo_t* pThrInfo, U64 lba, U32 len)
+{
+    U32 ret;
+
+    if (disk_writeuncor(pThrInfo->fd, lba, len))
+    {
+        pthread_mutex_lock(&mutex_msg);
+        gDiskIOInfo.status = STATUS_WRITE_ERROR;
+        dbg_printf(COLOR_YELLOW, "Loop[%d] Thread[%3d] LBA[%08llX] Len[%03X] WRITE UNC ERROR\n", pThrInfo->cr_loop, pThrInfo->id, lba, len);
+        pthread_mutex_unlock(&mutex_msg);
+
+        return 1;
+    }
+
+    return 0;
+}
+
+int thread_readuncor(ThreadInfo_t* pThrInfo, U64 lba, U32 len)
+{
+    U32 ret;
+
+    if (disk_read(pThrInfo->fd, pThrInfo->bufR, lba, len))
+    {
+        return 0;
+    }
+
+    return 1;
+}
+
 int disk_read(int fd, char* buf, U64 lba, U32 len)
 {
     #if   DISK_IO_ENGINE == IO_ENGINE_NVME
@@ -1692,14 +1875,16 @@ int nvme_write(int fd, char* buf, U64 lba, U32 len, U32 write_hint)
 int nvme_writeuncor(int fd, U64 lba, U32 len)
 {
     int ret;
-    struct nvme_user_io io;
+    struct nvme_passthru_cmd io;
 
     memset(&io, 0x00, sizeof(io));
     io.opcode  = nvme_cmd_write_uncor;
-    io.slba    = lba;
-    io.nblocks = len - 1;
+    io.nsid    = 1,
+    io.cdw10   = lba & 0xFFFFFFFF;
+    io.cdw11   = lba >> 32;
+    io.cdw12   = len - 1;
 
-    ret = ioctl(fd, NVME_IOCTL_SUBMIT_IO, (struct nvme_passthru_cmd*)&io);
+    ret = ioctl(fd, NVME_IOCTL_IO_CMD, &io);
 
     if (ret != 0)
     {
