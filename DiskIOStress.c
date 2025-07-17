@@ -166,7 +166,7 @@ enum
 
 #define SUPPORT_BLKDISCARD  TRUE
 #define SUPPORT_BLKFLUSH    TRUE
-#define SUPPORT_DATA_TAG    TRUE
+#define SUPPORT_DATA_TAG    FALSE
 #define SUPPORT_RE_READ     TRUE
 #define SUPPORT_DATA_VERIFY TRUE
 #define SUPPORT_SLEEP       TRUE
@@ -1632,8 +1632,7 @@ void dump_compare_error_buffer(ThreadInfo_t* pThrInfo, unsigned char* bufR, unsi
     FILE* fp;
     U32 i, offset, lba_offset;
     U32 dump_offset;
-    U64 lba_tag;
-    U32 hash_tag;
+    U32 lba_tag, hash_tag;
     char filename[256];
     char* bufXOR;
 
@@ -1649,7 +1648,7 @@ void dump_compare_error_buffer(ThreadInfo_t* pThrInfo, unsigned char* bufR, unsi
     }
 
     #if SUPPORT_DATA_TAG == TRUE
-        dump_offset = offset & 0xFFFFFF00;
+        dump_offset = offset & 0xFFFFFFF0;
     #else
         dump_offset = offset;
     #endif
@@ -1697,28 +1696,27 @@ void dump_compare_error_buffer(ThreadInfo_t* pThrInfo, unsigned char* bufR, unsi
         if ((i % 16) == 0)  printf("\n[%08X]:", dump_offset + i);
         printf(" %02X", bufR[dump_offset + i] & 0xFF);
 
-    #if SUPPORT_DATA_TAG == TRUE
-        // Traditional tag verification for other patterns
-        if (((dump_offset + i) & 0x1FF) == 0xF)
-        {
-            lba_tag = *((U64*)&bufR[(dump_offset + i - 0xF)]);
-            printf("%s|%016llX", COLOR_RESET, lba_tag);
+        #if SUPPORT_DATA_TAG == TRUE
+            if (((dump_offset + i) & 0x1FF) == 0xF)
+            {
+                lba_tag = *((U32*)&bufR[(dump_offset + i - 0xF)]);
+                printf("%s|%08X", COLOR_RESET, lba_tag);
 
-            if (lba_tag == lba) printf(":OK%s", COLOR_MAGENTA);
-            else                printf(":ERROR%s", COLOR_MAGENTA);
-        }
+                if (lba_tag == lba) printf(":OK%s", COLOR_MAGENTA);
+                else                printf(":ERROR%s", COLOR_MAGENTA);
+            }
 
-        if (((dump_offset + i) & 0x1FF) == 0x1FF)
-        {
-            hash_tag = *((U32*)&bufR[(dump_offset + i - 3)]);
-            printf("%s|%08X", COLOR_RESET, hash_tag);
+            if (((dump_offset + i) & 0x1FF) == 0x1FF)
+            {
+                hash_tag = *((U32*)&bufR[(dump_offset + i - 3)]);
+                printf("%s|%08X", COLOR_RESET, hash_tag);
 
-            if (hash_tag == ((~((U32)lba + 0x12345678)) & 0xFFFFFFFF))  printf(":OK%s", COLOR_MAGENTA);
-            else                                                        printf(":ERROR%s", COLOR_MAGENTA);
+                if (hash_tag == ((~((U32)lba + 0x12345678)) & 0xFFFFFFFF))  printf(":OK%s", COLOR_MAGENTA);
+                else                                                        printf(":ERROR%s", COLOR_MAGENTA);
 
-            lba++;
-        }
-    #endif
+                lba++;
+            }
+        #endif
     }
 
     printf("%s\n", COLOR_RESET);
@@ -1730,48 +1728,18 @@ void dump_compare_error_buffer(ThreadInfo_t* pThrInfo, unsigned char* bufR, unsi
 void generate_tag(unsigned char* bufW, ThreadInfo_t* pThrInfo, U64 curr_block)
 {
 #if SUPPORT_DATA_TAG == TRUE
-    U64 *ptr64;
-    U32 *ptr32;
-    U64 startTag;
-    U32 endTag;
+    U32 *ptr;
+    U32 tag;
     U32 idx;
-    struct timeval tv;
-    U64 timestamp_ms;
-
-    // For PATTERN_LBA mode, add enhanced timestamp tracking
-    if (pThrInfo->pattern_type == PATTERN_LBA)
-    {
-        // Get current system time in milliseconds
-        gettimeofday(&tv, NULL);
-        timestamp_ms = (U64)tv.tv_sec * 1000 + (U64)tv.tv_usec / 1000;
-    }
 
     for (idx = 0; idx < pThrInfo->block_count; idx++)
     {
-        if (pThrInfo->pattern_type == PATTERN_LBA)
-        {
-            startTag = timestamp_ms;
-        }
-        else
-        {
-            startTag  = curr_block + idx;
-        }
+        tag  = curr_block + idx;
+        ptr  = (U32*)(bufW + gDiskIOInfo.sz_block * idx);
+        *ptr = tag;
 
-        ptr64  = (U64*)(bufW + gDiskIOInfo.sz_block * idx);
-        *ptr64 = startTag;
-
-
-        if (pThrInfo->pattern_type == PATTERN_LBA)
-        {
-            endTag = pThrInfo->cr_loop;
-        }
-        else
-        {
-            endTag = ~((U32)startTag + 0x12345678);
-        }
-
-        ptr32  = (U32*)(bufW + gDiskIOInfo.sz_block * idx + gDiskIOInfo.sz_block - 4);
-        *ptr32 = endTag;
+        ptr  = (U32*)(bufW + gDiskIOInfo.sz_block * idx + gDiskIOInfo.sz_block - 4);
+        *ptr = ~(tag + 0x12345678);
     }
 #endif
 }
@@ -1782,7 +1750,7 @@ void generate_pattern(unsigned char* bufW, U32 size, U32 pattern_type, U64 curr_
     struct timeval tv;
     U64 timestamp_ms;
 
-    // 在所有 pattern 類型開始時取得時間戳
+    // Get timestamp at the beginning of all pattern types
     gettimeofday(&tv, NULL);
     timestamp_ms = (U64)tv.tv_sec * 1000 + (U64)tv.tv_usec / 1000;
 
