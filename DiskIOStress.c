@@ -127,10 +127,11 @@ enum
     PATTERN_SEQU_INC_DWORD,
     PATTERN_SEQU_DEC_DWORD,
     PATTERN_RANDOM,
+    PATTERN_LBA,
     PATTERN_MAX
 };
 
-const char* pattern_str[]=
+const char* pattern_str[] =
 {
     "All Zero",
     "All One",
@@ -143,6 +144,7 @@ const char* pattern_str[]=
     "Sequential DWord Increased",
     "Sequential DWord Decreased",
     "Random",
+    "LBA with Timestamp",
 };
 
 enum
@@ -158,7 +160,7 @@ enum
 #define IO_ENGINE_NVME      2
 #define IO_ENGINE_USB       3
 
-#define DEFAULT_PATTERN     PATTERN_RANDOM
+#define DEFAULT_PATTERN     PATTERN_LBA
 #define DEFAULT_WORKLOAD    WORKLOAD_RAND_WRC
 #define DISK_IO_ENGINE      IO_ENGINE_USB
 
@@ -169,6 +171,19 @@ enum
 #define SUPPORT_DATA_VERIFY TRUE
 #define SUPPORT_SLEEP       TRUE
 #define SUPPORT_OTF_FW_UPD  FALSE
+
+// USB power control settings
+#define SUPPORT_USB_POWER_CONTROL TRUE
+#define USB_AUTOSUSPEND_DELAY     1    // USB auto suspend delay time (seconds)
+#define USB_POWER_LOG_FILE        "usb_power.log"
+
+// Sleep mode options - can be combined with bitwise OR
+#define SLEEP_MODE_NONE     0
+#define SLEEP_MODE_S3       1  // S3 Sleep (suspend to RAM)
+#define SLEEP_MODE_S4       2  // S4 Sleep (suspend to disk/hibernate)
+#define SLEEP_MODE_BOTH     3  // Both S3 and S4 (alternating)
+
+#define DEFAULT_SLEEP_MODE  SLEEP_MODE_S3  // Default to S4 Sleep (suspend to disk/hibernate)
 
 /*===================================================
 | Structure
@@ -208,6 +223,8 @@ typedef struct
     StreamStatus_t stream_status;
     U32 rtc_cycle;
     U32 rtc_delay;
+    U32 sleep_mode;      // Sleep mode: S3, S4, or both
+    U32 current_sleep;   // Current sleep type being used (for alternating mode)
     U32 otf_delay;
     U32 otf_flag;
 } DiskIOInfo_t;
@@ -288,11 +305,17 @@ void*   otf_fwupd_thread_handler(void* data);
 U32     get_disk_info(char* device);
 void    show_result(struct tm* tm_info);
 void    set_process_priority(S32 priority);
+
+// USB power control functions
+int     configure_usb_power_for_sleep(void);
+int     restore_usb_power_after_wake(void);
+int     write_to_sysfs_file(const char* path, const char* value);
+void    log_usb_power_status(const char* phase);
 U32     get_timeval_sec(struct timeval base_timeval);
 double  get_timeval_sec_usec(struct timeval base_timeval);
 U32     get_core_number(void);
 void    dump_compare_error_buffer(ThreadInfo_t* pThrInfo, unsigned char* bufR, unsigned char* bufW, U64 lba);
-void    generate_pattern(unsigned char* bufW, U32 size, U32 pattern_type);
+void    generate_pattern(unsigned char* bufW, U32 size, U32 pattern_type, U64 curr_block);
 void    generate_tag(unsigned char* bufW, ThreadInfo_t* pThrInfo, U64 curr_block);
 void    show_usage(int argc, char* argv[]);
 
@@ -451,6 +474,11 @@ int main(int argc, char *argv[])
             show_usage(argc, argv);
             exit(1);
         }
+        else
+        {
+            // Command parser succeeded, return to avoid running disk stress test
+            return 0;
+        }
     }
     else
     {
@@ -460,7 +488,12 @@ int main(int argc, char *argv[])
             exit(1);
         }
 
-        //----------------------------------------------------------------------
+        // Set default sleep mode
+        gDiskIOInfo.sleep_mode = DEFAULT_SLEEP_MODE;
+        gDiskIOInfo.current_sleep = (DEFAULT_SLEEP_MODE == SLEEP_MODE_BOTH) ? SLEEP_MODE_S3 : DEFAULT_SLEEP_MODE;
+
+
+        // Common configuration setup for both sleep mode and normal operation
         gDiskIOInfo.nr_loop   = MAX_LOOP_NUM;
         gDiskIOInfo.sz_trunk  = MAX_TRUNK_SIZE;
         gDiskIOInfo.nr_thread = MAX_THREAD_NUM;
@@ -485,7 +518,30 @@ int main(int argc, char *argv[])
         printf("= Sector Size      : %d Bytes\n", gDiskIOInfo.sz_block);
         printf("= Capacity         : %.2f GB (0x%llX)\n", (double)gDiskIOInfo.nr_block * gDiskIOInfo.sz_block / (1024 * 1024 * 1024), gDiskIOInfo.nr_block);
         printf("= Stream Directive : %s (MSL:%d, SWS:%d KB, SGS:%d MB)\n", (gDiskIOInfo.stream_support)?"SUPPORT":"NOT SUPPORT", gDiskIOInfo.stream_param.msl, gDiskIOInfo.stream_param.sws, gDiskIOInfo.stream_param.sgs);
-        printf("= S3 Sleep         : %s (Sleep:%d, Delay:%d ~ %d Sec)\n", (SUPPORT_SLEEP)?"ON":"OFF", MAX_SLEEP_TIME, MIN_SLEEP_DELAY, MAX_SLEEP_DELAY);
+
+        // Display sleep mode configuration
+        if (SUPPORT_SLEEP)
+        {
+            const char* sleep_status;
+            switch(gDiskIOInfo.sleep_mode)
+            {
+                case SLEEP_MODE_NONE: sleep_status = "OFF"; break;
+                case SLEEP_MODE_S3:   sleep_status = "S3 Only"; break;
+                case SLEEP_MODE_S4:   sleep_status = "S4 Only"; break;
+                case SLEEP_MODE_BOTH: sleep_status = "S3+S4 Alternating"; break;
+                default:              sleep_status = "Unknown"; break;
+            }
+            printf("= Sleep Mode       : %s (Sleep:%d, Delay:%d ~ %d Sec)\n", sleep_status, MAX_SLEEP_TIME, MIN_SLEEP_DELAY, MAX_SLEEP_DELAY);
+            if (DISK_IO_ENGINE == IO_ENGINE_USB && SUPPORT_USB_POWER_CONTROL)
+            {
+                printf("= USB Power Control: ON (Auto power-off during sleep)\n");
+            }
+        }
+        else
+        {
+            printf("= Sleep Mode       : OFF (SUPPORT_SLEEP disabled)\n");
+        }
+
         printf("= OTF Update       : %s (Delay:%d ~ %d Sec)\n", (SUPPORT_OTF_FW_UPD)?"ON":"OFF", MIN_OTF_DELAY, MAX_OTF_DELAY);
         printf("=== Start Testing =========================\n");
 
@@ -660,12 +716,13 @@ int wl_seq_wrc(ThreadInfo_t* pThrInfo)
     {
         for (pThrInfo->cr_trunk = 0; pThrInfo->cr_trunk < pThrInfo->nr_trunk; pThrInfo->cr_trunk++)
         {
-            generate_pattern(pThrInfo->bufW, SIZE_1M, pThrInfo->pattern_type);
-
             // === Write ================================
             cmds          = 0;
             curr_block    = pThrInfo->block_start + pThrInfo->block_per_trunk * pThrInfo->cr_trunk;
             pThrInfo->ops = OPS_WRITE;
+
+            generate_pattern(pThrInfo->bufW, SIZE_1M, pThrInfo->pattern_type, curr_block);
+
             while (cmds < pThrInfo->block_per_trunk / pThrInfo->block_count)
             {
                 generate_tag(pThrInfo->bufW, pThrInfo, curr_block);
@@ -740,12 +797,13 @@ int wl_seq_w1rcn(ThreadInfo_t* pThrInfo)
         {
             if (pThrInfo->cr_loop == 0)
             {
-                generate_pattern(pThrInfo->bufW, SIZE_1M, pThrInfo->pattern_type);
-
                 // === Write ================================
                 cmds          = 0;
                 curr_block    = pThrInfo->block_start + pThrInfo->block_per_trunk * pThrInfo->cr_trunk;
                 pThrInfo->ops = OPS_WRITE;
+
+                generate_pattern(pThrInfo->bufW, SIZE_1M, pThrInfo->pattern_type, curr_block);
+
                 while (cmds < pThrInfo->block_per_trunk / pThrInfo->block_count)
                 {
                     generate_tag(pThrInfo->bufW, pThrInfo, curr_block);
@@ -822,12 +880,13 @@ int wl_seq_wrrc(ThreadInfo_t* pThrInfo)
     {
         for (pThrInfo->cr_trunk = 0; pThrInfo->cr_trunk < pThrInfo->nr_trunk; pThrInfo->cr_trunk++)
         {
-            generate_pattern(pThrInfo->bufW, SIZE_1M, pThrInfo->pattern_type);
-
             // === Write ================================
             cmds          = 0;
             curr_block    = pThrInfo->block_start + pThrInfo->block_per_trunk * pThrInfo->cr_trunk;
             pThrInfo->ops = OPS_WRITE;
+
+            generate_pattern(pThrInfo->bufW, SIZE_1M, pThrInfo->pattern_type, curr_block);
+
             while (cmds < pThrInfo->block_per_trunk / pThrInfo->block_count)
             {
                 generate_tag(pThrInfo->bufW, pThrInfo, curr_block);
@@ -884,18 +943,19 @@ int wl_rand_wrc(ThreadInfo_t* pThrInfo)
 
     for (pThrInfo->cr_loop = 0; pThrInfo->cr_loop < pThrInfo->nr_loop; pThrInfo->cr_loop++)
     {
-        generate_pattern(pThrInfo->bufW, SIZE_1M, pThrInfo->pattern_type);
-
         pThrInfo->block_count = (rand() % gDiskIOInfo.max_sector) + 1;
 
         start_block = pThrInfo->block_start + (rand() % (pThrInfo->block_end - pThrInfo->block_start));
 
-        do {
+        do
+        {
             end_block = start_block + (rand() % pThrInfo->block_per_trunk) + 1;
         } while((start_block + pThrInfo->block_count) > end_block);
 
         end_block = (end_block > pThrInfo->block_end) ? pThrInfo->block_end: end_block;
         cmd_count = (end_block - start_block) / pThrInfo->block_count;
+
+        generate_pattern(pThrInfo->bufW, SIZE_1M, pThrInfo->pattern_type, start_block);
 
         // === Sequentail Write ================================
         curr_block    = start_block;
@@ -1008,9 +1068,10 @@ int wl_rand_wur(ThreadInfo_t* pThrInfo)
 
     for (pThrInfo->cr_loop = 0; pThrInfo->cr_loop < pThrInfo->nr_loop; pThrInfo->cr_loop++)
     {
-        generate_pattern(pThrInfo->bufW, SIZE_1M, pThrInfo->pattern_type);
         pThrInfo->block_count = (rand() % gDiskIOInfo.max_sector) + 1;
         start_block = pThrInfo->block_start + (rand() % (pThrInfo->block_end - pThrInfo->block_start));
+
+        generate_pattern(pThrInfo->bufW, SIZE_1M, pThrInfo->pattern_type, start_block);
 
         do
         {
@@ -1068,19 +1129,6 @@ int wl_rand_wur(ThreadInfo_t* pThrInfo)
             if (gDiskIOInfo.status) return 1;
             else if (gDiskIOInfo.otf_flag == OTF_HALT) break;
         }
-
-        // === Random Write UNC ============================
-        // cmds          = 0;
-        // pThrInfo->ops = OPS_WRITE_UNCOR;
-        // while (cmds++ < cmd_count)
-        // {
-        //     curr_block = start_block + (rand() % cmd_count) * pThrInfo->block_count;
-        //     generate_tag(pThrInfo->bufW, pThrInfo, curr_block);
-        //     thread_writeuncor(pThrInfo, curr_block, pThrInfo->block_count);
-
-        //     if (gDiskIOInfo.status) return 1;
-        //     else if (gDiskIOInfo.otf_flag == OTF_HALT) break;
-        // }
 
     #if DISK_IO_ENGINE == IO_ENGINE_SYSTEM
         ioctl(pThrInfo->fd, BLKFLSBUF, 0);
@@ -1181,7 +1229,6 @@ void* timer_thread_handler(void *data)
 void* rtc_thread_handler(void *data)
 {
     char cmd[80];
-    sprintf(cmd, "sudo rtcwake -m mem -s %d >rtc.log", MAX_SLEEP_TIME);
 
     gDiskIOInfo.rtc_delay = MIN_SLEEP_DELAY * 4;
 
@@ -1192,7 +1239,84 @@ void* rtc_thread_handler(void *data)
             if (gDiskIOInfo.rtc_delay == 0)
             {
                 pthread_mutex_lock(&mutex_ops);
-                system(cmd);
+
+                // Determine which sleep mode to use
+                // Using simpler redirection to avoid permission issues
+                switch (gDiskIOInfo.sleep_mode)
+                {
+                    case SLEEP_MODE_NONE:
+                        // Skip sleep, just update delay
+                        break;
+
+                    case SLEEP_MODE_S3:
+                        // S3 Sleep (suspend to RAM)
+                        if (DISK_IO_ENGINE == IO_ENGINE_USB)
+                        {
+                            configure_usb_power_for_sleep();
+                        }
+                        sprintf(cmd, "sudo sh -c 'rtcwake -m mem -s %d > rtc.log 2>&1'", MAX_SLEEP_TIME);
+                        if (system(cmd) != 0)
+                        {
+                            dbg_printf(COLOR_RED, "S3 sleep failed\n");
+                        }
+                        if (DISK_IO_ENGINE == IO_ENGINE_USB)
+                        {
+                            restore_usb_power_after_wake();
+                        }
+                        break;
+
+                    case SLEEP_MODE_S4:
+                        // S4 Sleep (suspend to disk/hibernate)
+                        if (DISK_IO_ENGINE == IO_ENGINE_USB)
+                        {
+                            configure_usb_power_for_sleep();
+                        }
+                        sprintf(cmd, "sudo sh -c 'rtcwake -m disk -s %d > rtc.log 2>&1'", MAX_SLEEP_TIME);
+                        if (system(cmd) != 0)
+                        {
+                            dbg_printf(COLOR_RED, "S4 sleep failed\n");
+                        }
+                        if (DISK_IO_ENGINE == IO_ENGINE_USB)
+                        {
+                            restore_usb_power_after_wake();
+                        }
+                        break;
+
+                    case SLEEP_MODE_BOTH:
+                        // Alternate between S3 and S4
+                        if (DISK_IO_ENGINE == IO_ENGINE_USB)
+                        {
+                            configure_usb_power_for_sleep();
+                        }
+                        if (gDiskIOInfo.current_sleep == SLEEP_MODE_S3)
+                        {
+                            sprintf(cmd, "sudo sh -c 'rtcwake -m mem -s %d > rtc.log 2>&1'", MAX_SLEEP_TIME);
+                            if (system(cmd) != 0)
+                            {
+                                dbg_printf(COLOR_RED, "S3 sleep failed\n");
+                            }
+                            gDiskIOInfo.current_sleep = SLEEP_MODE_S4; // Switch to S4 next time
+                        }
+                        else
+                        {
+                            sprintf(cmd, "sudo sh -c 'rtcwake -m disk -s %d > rtc.log 2>&1'", MAX_SLEEP_TIME);
+                            if (system(cmd) != 0)
+                            {
+                                dbg_printf(COLOR_RED, "S4 sleep failed\n");
+                            }
+                            gDiskIOInfo.current_sleep = SLEEP_MODE_S3; // Switch to S3 next time
+                        }
+                        if (DISK_IO_ENGINE == IO_ENGINE_USB)
+                        {
+                            restore_usb_power_after_wake();
+                        }
+                        break;
+
+                    default:
+                        // Unknown sleep mode, skip sleep
+                        break;
+                }
+
                 gDiskIOInfo.rtc_delay = (MIN_SLEEP_DELAY + (rand() % (MAX_SLEEP_DELAY - MIN_SLEEP_DELAY))) * 4;
                 gDiskIOInfo.rtc_cycle++;
                 pthread_mutex_unlock(&mutex_ops);
@@ -1344,12 +1468,15 @@ U32 get_disk_info(char* device)
             U64 total_blocks;
             U32 block_size;
 
-            if (scsi_read_capacity(fd, &total_blocks, &block_size) == 0) {
+            if (scsi_read_capacity(fd, &total_blocks, &block_size) == 0)
+            {
                 gDiskIOInfo.sz_block = block_size;
                 gDiskIOInfo.nr_block = total_blocks;
                 // Set conservative max_sector for USB devices (64 sectors = 32KB max transfer)
                 gDiskIOInfo.max_sector = 64; // Conservative limit for USB SCSI devices
-            } else {
+            }
+            else
+            {
                 // Fallback to safe defaults if SCSI commands fail
                 gDiskIOInfo.sz_block = 512;
                 gDiskIOInfo.nr_block = 1000000; // 500MB default
@@ -1364,7 +1491,8 @@ U32 get_disk_info(char* device)
             if (gDiskIOInfo.max_sector > 2048) gDiskIOInfo.max_sector = 2048;
 
             // Prevent division by zero
-            if (gDiskIOInfo.sz_block == 0) {
+            if (gDiskIOInfo.sz_block == 0)
+            {
                 gDiskIOInfo.sz_block = 512; // Default sector size
             }
 
@@ -1504,7 +1632,8 @@ void dump_compare_error_buffer(ThreadInfo_t* pThrInfo, unsigned char* bufR, unsi
     FILE* fp;
     U32 i, offset, lba_offset;
     U32 dump_offset;
-    U32 lba_tag, hash_tag;
+    U64 lba_tag;
+    U32 hash_tag;
     char filename[256];
     char* bufXOR;
 
@@ -1520,7 +1649,7 @@ void dump_compare_error_buffer(ThreadInfo_t* pThrInfo, unsigned char* bufR, unsi
     }
 
     #if SUPPORT_DATA_TAG == TRUE
-        dump_offset = offset & 0xFFFFFFF0;
+        dump_offset = offset & 0xFFFFFF00;
     #else
         dump_offset = offset;
     #endif
@@ -1568,27 +1697,28 @@ void dump_compare_error_buffer(ThreadInfo_t* pThrInfo, unsigned char* bufR, unsi
         if ((i % 16) == 0)  printf("\n[%08X]:", dump_offset + i);
         printf(" %02X", bufR[dump_offset + i] & 0xFF);
 
-        #if SUPPORT_DATA_TAG == TRUE
-            if (((dump_offset + i) & 0x1FF) == 0xF)
-            {
-                lba_tag = *((U32*)&bufR[(dump_offset + i - 0xF)]);
-                printf("%s|%08X", COLOR_RESET, lba_tag);
+    #if SUPPORT_DATA_TAG == TRUE
+        // Traditional tag verification for other patterns
+        if (((dump_offset + i) & 0x1FF) == 0xF)
+        {
+            lba_tag = *((U64*)&bufR[(dump_offset + i - 0xF)]);
+            printf("%s|%016llX", COLOR_RESET, lba_tag);
 
-                if (lba_tag == lba) printf(":OK%s", COLOR_MAGENTA);
-                else                printf(":ERROR%s", COLOR_MAGENTA);
-            }
+            if (lba_tag == lba) printf(":OK%s", COLOR_MAGENTA);
+            else                printf(":ERROR%s", COLOR_MAGENTA);
+        }
 
-            if (((dump_offset + i) & 0x1FF) == 0x1FF)
-            {
-                hash_tag = *((U32*)&bufR[(dump_offset + i - 3)]);
-                printf("%s|%08X", COLOR_RESET, hash_tag);
+        if (((dump_offset + i) & 0x1FF) == 0x1FF)
+        {
+            hash_tag = *((U32*)&bufR[(dump_offset + i - 3)]);
+            printf("%s|%08X", COLOR_RESET, hash_tag);
 
-                if (hash_tag == ((~((U32)lba + 0x12345678)) & 0xFFFFFFFF))  printf(":OK%s", COLOR_MAGENTA);
-                else                                                        printf(":ERROR%s", COLOR_MAGENTA);
+            if (hash_tag == ((~((U32)lba + 0x12345678)) & 0xFFFFFFFF))  printf(":OK%s", COLOR_MAGENTA);
+            else                                                        printf(":ERROR%s", COLOR_MAGENTA);
 
-                lba++;
-            }
-        #endif
+            lba++;
+        }
+    #endif
     }
 
     printf("%s\n", COLOR_RESET);
@@ -1600,25 +1730,61 @@ void dump_compare_error_buffer(ThreadInfo_t* pThrInfo, unsigned char* bufR, unsi
 void generate_tag(unsigned char* bufW, ThreadInfo_t* pThrInfo, U64 curr_block)
 {
 #if SUPPORT_DATA_TAG == TRUE
-    U32 *ptr;
-    U32 tag;
+    U64 *ptr64;
+    U32 *ptr32;
+    U64 startTag;
+    U32 endTag;
     U32 idx;
+    struct timeval tv;
+    U64 timestamp_ms;
+
+    // For PATTERN_LBA mode, add enhanced timestamp tracking
+    if (pThrInfo->pattern_type == PATTERN_LBA)
+    {
+        // Get current system time in milliseconds
+        gettimeofday(&tv, NULL);
+        timestamp_ms = (U64)tv.tv_sec * 1000 + (U64)tv.tv_usec / 1000;
+    }
 
     for (idx = 0; idx < pThrInfo->block_count; idx++)
     {
-        tag  = curr_block + idx;
-        ptr  = (U32*)(bufW + gDiskIOInfo.sz_block * idx);
-        *ptr = tag;
+        if (pThrInfo->pattern_type == PATTERN_LBA)
+        {
+            startTag = timestamp_ms;
+        }
+        else
+        {
+            startTag  = curr_block + idx;
+        }
 
-        ptr  = (U32*)(bufW + gDiskIOInfo.sz_block * idx + gDiskIOInfo.sz_block - 4);
-        *ptr = ~(tag + 0x12345678);
+        ptr64  = (U64*)(bufW + gDiskIOInfo.sz_block * idx);
+        *ptr64 = startTag;
+
+
+        if (pThrInfo->pattern_type == PATTERN_LBA)
+        {
+            endTag = pThrInfo->cr_loop;
+        }
+        else
+        {
+            endTag = ~((U32)startTag + 0x12345678);
+        }
+
+        ptr32  = (U32*)(bufW + gDiskIOInfo.sz_block * idx + gDiskIOInfo.sz_block - 4);
+        *ptr32 = endTag;
     }
 #endif
 }
 
-void generate_pattern(unsigned char* bufW, U32 size, U32 pattern_type)
+void generate_pattern(unsigned char* bufW, U32 size, U32 pattern_type, U64 curr_block)
 {
-    U32 i;
+    U32 i, j;
+    struct timeval tv;
+    U64 timestamp_ms;
+
+    // 在所有 pattern 類型開始時取得時間戳
+    gettimeofday(&tv, NULL);
+    timestamp_ms = (U64)tv.tv_sec * 1000 + (U64)tv.tv_usec / 1000;
 
     switch (pattern_type)
     {
@@ -1698,6 +1864,57 @@ void generate_pattern(unsigned char* bufW, U32 size, U32 pattern_type)
             for (i = 1; i < size / 32 / SIZE_1K; i++)
             {
                 memcpy(&bufW[i * SIZE_1K * 32], &bufW[0], SIZE_1K * 32);
+            }
+            break;
+        }
+        case PATTERN_LBA:
+        {
+            U32 block_size = gDiskIOInfo.sz_block;
+            U32 blocks_in_buffer = size / block_size;
+
+            // Clear buffer
+            memset(bufW, 0, size);
+
+            // Fill offset-based LBA pattern for each block
+            for (i = 0; i < blocks_in_buffer; i++)
+            {
+                U32 block_offset = i * block_size;
+                U64 current_lba = curr_block + i;
+                U32* ptr32;
+                U64* ptr64;
+
+                // First 8 bytes: timestamp (milliseconds since epoch)
+                ptr64 = (U64*)(bufW + block_offset);
+                *ptr64 = timestamp_ms;
+
+                // Next 4 bytes: current block's LBA (starting from offset 8)
+                ptr32 = (U32*)(bufW + block_offset + 8);
+                *ptr32 = (U32)current_lba;
+
+                // From byte 12 onwards: fill with offset-based LBA value to end of block
+                ptr32 = (U32*)(bufW + block_offset + 12);
+                U32 remaining_bytes = block_size - 12;
+                U32 dword_count = remaining_bytes / 4;
+                U32 extra_bytes = remaining_bytes % 4;
+
+                // Fill remaining complete DWORDs with offset-based LBA value
+                for (j = 0; j < dword_count; j++)
+                {
+                    ptr32[j] = (U32)current_lba;
+                }
+
+                // Handle remaining bytes less than 4
+                if (extra_bytes > 0)
+                {
+                    U32 offset_lba = (U32)current_lba;
+                    unsigned char* last_bytes = (unsigned char*)&ptr32[dword_count];
+                    unsigned char* lba_bytes = (unsigned char*)&offset_lba;
+
+                    for (j = 0; j < extra_bytes; j++)
+                    {
+                        last_bytes[j] = lba_bytes[j];
+                    }
+                }
             }
             break;
         }
@@ -2327,7 +2544,8 @@ int scsi_read(int fd, char* buf, U64 lba, U32 len)
     int ret;
 
     // Check for LBA range - use READ(10) for better compatibility
-    if (lba > 0xFFFFFFFF || len > 0xFFFF) {
+    if (lba > 0xFFFFFFFF || len > 0xFFFF)
+    {
         // For large LBA, we should split the operation
         // For now, return error to avoid issues
         return -1;
@@ -2366,16 +2584,19 @@ int scsi_read(int fd, char* buf, U64 lba, U32 len)
 
     ret = ioctl(fd, SG_IO, &io_hdr);
 
-    if (ret < 0 || io_hdr.status != 0) {
+    if (ret < 0 || io_hdr.status != 0)
+    {
         // Add debug information for read errors
-        if (io_hdr.status != 0) {
+        if (io_hdr.status != 0)
+        {
             unsigned char sense_key = sense_buffer[2] & 0x0f;
             unsigned char asc = sense_buffer[12];
             unsigned char ascq = sense_buffer[13];
 
             // Only print debug info for first few errors to avoid spam
             static int read_error_count = 0;
-            if (read_error_count < 3) {
+            if (read_error_count < 3)
+            {
                 printf("SCSI READ error: status=0x%02X, sense=0x%02X, asc=0x%02X, ascq=0x%02X, LBA=%llu, len=%u\n",
                        io_hdr.status, sense_key, asc, ascq, (unsigned long long)lba, len);
                 read_error_count++;
@@ -2395,7 +2616,8 @@ int scsi_write(int fd, char* buf, U64 lba, U32 len)
     int ret;
 
     // Check for LBA range - use WRITE(10) for better compatibility
-    if (lba > 0xFFFFFFFF || len > 0xFFFF) {
+    if (lba > 0xFFFFFFFF || len > 0xFFFF)
+    {
         // For large LBA, we should split the operation
         // For now, return error to avoid issues
         return -1;
@@ -2434,16 +2656,19 @@ int scsi_write(int fd, char* buf, U64 lba, U32 len)
 
     ret = ioctl(fd, SG_IO, &io_hdr);
 
-    if (ret < 0 || io_hdr.status != 0) {
+    if (ret < 0 || io_hdr.status != 0)
+    {
         // Add debug information for write errors
-        if (io_hdr.status != 0) {
+        if (io_hdr.status != 0)
+        {
             unsigned char sense_key = sense_buffer[2] & 0x0f;
             unsigned char asc = sense_buffer[12];
             unsigned char ascq = sense_buffer[13];
 
             // Only print debug info for first few errors to avoid spam
             static int error_count = 0;
-            if (error_count < 3) {
+            if (error_count < 3)
+            {
                 printf("SCSI WRITE error: status=0x%02X, sense=0x%02X, asc=0x%02X, ascq=0x%02X, LBA=%llu, len=%u\n",
                        io_hdr.status, sense_key, asc, ascq, (unsigned long long)lba, len);
                 error_count++;
@@ -2499,7 +2724,8 @@ int scsi_writeuncor(int fd, U64 lba, U32 len)
 
     ret = ioctl(fd, SG_IO, &io_hdr);
 
-    if (ret < 0 || io_hdr.status != 0) {
+    if (ret < 0 || io_hdr.status != 0)
+    {
         return -1;
     }
 
@@ -2534,7 +2760,8 @@ int scsi_flush(int fd)
 
     ret = ioctl(fd, SG_IO, &io_hdr);
 
-    if (ret < 0 || io_hdr.status != 0) {
+    if (ret < 0 || io_hdr.status != 0)
+    {
         return -1;
     }
 
@@ -2600,16 +2827,19 @@ int scsi_trim(int fd, U64 lba, U32 len)
 
     ret = ioctl(fd, SG_IO, &io_hdr);
 
-    if (ret < 0 || io_hdr.status != 0) {
+    if (ret < 0 || io_hdr.status != 0)
+    {
         // Add debug information for trim errors
-        if (io_hdr.status != 0) {
+        if (io_hdr.status != 0)
+        {
             unsigned char sense_key = sense_buffer[2] & 0x0f;
             unsigned char asc = sense_buffer[12];
             unsigned char ascq = sense_buffer[13];
 
             // Only print debug info for first few errors to avoid spam
             static int trim_error_count = 0;
-            if (trim_error_count < 3) {
+            if (trim_error_count < 3)
+            {
                 printf("SCSI TRIM error: status=0x%02X, sense=0x%02X, asc=0x%02X, ascq=0x%02X, LBA=%llu, len=%u\n",
                        io_hdr.status, sense_key, asc, ascq, (unsigned long long)lba, len);
                 trim_error_count++;
@@ -2653,7 +2883,8 @@ int scsi_inquiry(int fd, char* buf, int buf_len)
 
     ret = ioctl(fd, SG_IO, &io_hdr);
 
-    if (ret < 0 || io_hdr.status != 0) {
+    if (ret < 0 || io_hdr.status != 0)
+    {
         return -1;
     }
 
@@ -2696,7 +2927,8 @@ int scsi_read_capacity(int fd, U64* total_blocks, U32* block_size)
 
     ret = ioctl(fd, SG_IO, &io_hdr);
 
-    if (ret < 0 || io_hdr.status != 0) {
+    if (ret < 0 || io_hdr.status != 0)
+    {
         return -1;
     }
 
@@ -2745,7 +2977,8 @@ int scsi_test_unit_ready(int fd)
 
     ret = ioctl(fd, SG_IO, &io_hdr);
 
-    if (ret < 0 || io_hdr.status != 0) {
+    if (ret < 0 || io_hdr.status != 0)
+    {
         return -1;
     }
 
@@ -3446,4 +3679,153 @@ void show_usage(int argc, char* argv[])
     }
 
     printf("-------------------------------------------------------------------------------\n");
+}
+
+/*===================================================
+| USB Power Control Functions Implementation
+===================================================*/
+
+/*===================================================
+| USB Power Control Functions
+===================================================*/
+int write_to_sysfs_file(const char* path, const char* value)
+{
+    int fd;
+    ssize_t bytes_written;
+    size_t value_len;
+
+    fd = open(path, O_WRONLY);
+    if (fd == -1)
+    {
+        return -1;
+    }
+
+    value_len = strlen(value);
+    bytes_written = write(fd, value, value_len);
+    close(fd);
+
+    return (bytes_written == value_len) ? 0 : -1;
+}
+
+void log_usb_power_status(const char* phase)
+{
+    char cmd[256];
+    sprintf(cmd, "sudo sh -c 'echo \"=== USB Power Status %s ===\" >> %s'", phase, USB_POWER_LOG_FILE);
+    system(cmd);
+
+    sprintf(cmd, "sudo sh -c 'date >> %s'", USB_POWER_LOG_FILE);
+    system(cmd);
+
+    sprintf(cmd, "sudo sh -c 'lsusb >> %s 2>&1'", USB_POWER_LOG_FILE);
+    system(cmd);
+}
+
+int configure_usb_power_for_sleep(void)
+{
+    char path[256];
+    char cmd[512];
+    FILE* fp;
+    int success_count;
+    int total_count;
+
+    success_count = 0;
+    total_count = 0;
+
+    dbg_printf(COLOR_CYAN, "Configuring USB power management for sleep...\n");
+
+    // Log power status before sleep
+    log_usb_power_status("before_sleep");
+
+    // 1. Disable USB wake functionality
+    fp = popen("find /sys/bus/usb/devices -name 'wakeup' -path '*/power/wakeup' 2>/dev/null", "r");
+    if (fp != NULL)
+    {
+        while (fgets(path, sizeof(path), fp) != NULL)
+        {
+            // Remove newline character
+            path[strcspn(path, "\n")] = '\0';
+            total_count++;
+
+            sprintf(cmd, "sudo sh -c 'echo \"disabled\" > \"%s\" 2>/dev/null'", path);
+            if (system(cmd) == 0)
+            {
+                success_count++;
+                dbg_printf(COLOR_GREEN, "Disabled wake: %s\n", path);
+            }
+        }
+        pclose(fp);
+    }
+
+    // 2. Set USB auto suspend mode
+    fp = popen("find /sys/bus/usb/devices -name 'control' -path '*/power/control' 2>/dev/null", "r");
+    if (fp != NULL)
+    {
+        while (fgets(path, sizeof(path), fp) != NULL)
+        {
+            path[strcspn(path, "\n")] = '\0';
+            total_count++;
+
+            sprintf(cmd, "sudo sh -c 'echo \"auto\" > \"%s\" 2>/dev/null'", path);
+            if (system(cmd) == 0)
+            {
+                success_count++;
+                dbg_printf(COLOR_GREEN, "Set auto suspend: %s\n", path);
+            }
+        }
+        pclose(fp);
+    }
+
+    // 3. Set short auto suspend timeout (1 second)
+    fp = popen("find /sys/bus/usb/devices -name 'autosuspend' -path '*/power/autosuspend' 2>/dev/null", "r");
+    if (fp != NULL)
+    {
+        while (fgets(path, sizeof(path), fp) != NULL)
+        {
+            path[strcspn(path, "\n")] = '\0';
+            total_count++;
+
+            sprintf(cmd, "sudo sh -c 'echo \"1\" > \"%s\" 2>/dev/null'", path);
+            if (system(cmd) == 0)
+            {
+                success_count++;
+                dbg_printf(COLOR_GREEN, "Set suspend timeout: %s\n", path);
+            }
+        }
+        pclose(fp);
+    }
+
+    // 4. Configure USB controller power management
+    system("for controller in /sys/bus/pci/devices/*/power/control; do "
+           "if [ -f \"$controller\" ]; then "
+           "device_path=$(dirname \"$controller\"); "
+           "if [ -f \"$device_path/class\" ]; then "
+           "device_class=$(cat \"$device_path/class\" 2>/dev/null); "
+           "if echo \"$device_class\" | grep -q '^0x0c03'; then "
+           "echo 'auto' > \"$controller\" 2>/dev/null; "
+           "fi; fi; fi; done");    // 5. Set USB core module parameters
+    system("sudo sh -c 'echo \"options usbcore autosuspend=1\" > /etc/modprobe.d/usb-power-save.conf 2>/dev/null'");
+
+    dbg_printf(COLOR_GREEN, "USB power management configured successfully (%d/%d)\n", success_count, total_count);
+    return 0;
+}
+
+int restore_usb_power_after_wake(void)
+{
+    dbg_printf(COLOR_CYAN, "Restoring USB power settings after wake...\n");
+
+    // Log power status after wake
+    log_usb_power_status("after_wake");
+
+    // Rescan USB devices
+    system("echo '1' > /sys/bus/usb/drivers_probe 2>/dev/null");
+    system("for hub in /sys/bus/usb/devices/usb*/authorized; do "
+           "echo '1' > \"$hub\" 2>/dev/null; done");
+
+    // Wait for device re-initialization
+    usleep(2000000); // 2 seconds    dbg_printf(COLOR_GREEN, "USB power restoration completed\n");
+
+    // Check USB storage device status
+    system("sudo sh -c 'lsblk | grep -i usb > /tmp/usb_devices_after_wake.log 2>&1'");
+
+    return 0;
 }
