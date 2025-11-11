@@ -16,7 +16,6 @@ E-mail: xinyu0123@gmail.com
 #include <linux/falloc.h>
 #include <scsi/sg.h>
 #include <scsi/scsi.h>
-#include <sync.h>
 
 #include "nvme.h"
 
@@ -36,7 +35,7 @@ E-mail: xinyu0123@gmail.com
 #define ONE_MININUTE_IN_SEC 60
 #define ONE_HOUR_IN_SEC     (60 * ONE_MININUTE_IN_SEC)
 #define ONE_DAY_IN_SEC      (24 * ONE_HOUR_IN_SEC)
-#define MAX_TEST_TIME       (24 * ONE_HOUR_IN_SEC) //(86400 * 7)
+#define MAX_TEST_TIME       (3 * ONE_DAY_IN_SEC)
 #define MAX_STREAM_NUM      128
 #define MAX_SECTOR_COUNT    2048
 
@@ -174,7 +173,7 @@ enum
 #define SUPPORT_OTF_FW_UPD  FALSE
 
 // USB power control settings
-#define SUPPORT_USB_POWER_CONTROL TRUE
+#define SUPPORT_USB_POWER_CONTROL FALSE
 #define USB_AUTOSUSPEND_DELAY     1    // USB auto suspend delay time (seconds)
 #define USB_POWER_LOG_FILE        "usb_power.log"
 
@@ -184,7 +183,7 @@ enum
 #define SLEEP_MODE_S4       2  // S4 Sleep (suspend to disk/hibernate)
 #define SLEEP_MODE_BOTH     3  // Both S3 and S4 (alternating)
 
-#define DEFAULT_SLEEP_MODE  SLEEP_MODE_S4  // Default to S4 Sleep (suspend to disk/hibernate)
+#define DEFAULT_SLEEP_MODE  SLEEP_MODE_S3  // Default to S4 Sleep (suspend to disk/hibernate)
 
 /*===================================================
 | Structure
@@ -1251,44 +1250,36 @@ void* rtc_thread_handler(void *data)
 
                     case SLEEP_MODE_S3:
                         // S3 Sleep (suspend to RAM)
-                        // if (DISK_IO_ENGINE == IO_ENGINE_USB)
-                        // {
-                        //     configure_usb_power_for_sleep();
-                        // }
                         sprintf(cmd, "sudo sh -c 'rtcwake -m mem -s %d > rtc.log 2>&1'", MAX_SLEEP_TIME);
                         if (system(cmd) != 0)
                         {
                             dbg_printf(COLOR_RED, "S3 sleep failed\n");
                         }
-                        // if (DISK_IO_ENGINE == IO_ENGINE_USB)
-                        // {
-                        //     restore_usb_power_after_wake();
-                        // }
                         break;
 
                     case SLEEP_MODE_S4:
                         // S4 Sleep (suspend to disk/hibernate)
-                        // if (DISK_IO_ENGINE == IO_ENGINE_USB)
-                        // {
-                        //     configure_usb_power_for_sleep();
-                        // }
+                        if (DISK_IO_ENGINE == IO_ENGINE_USB)
+                        {
+                            configure_usb_power_for_sleep();
+                        }
                         sprintf(cmd, "sudo sh -c 'rtcwake -m disk -s %d > rtc.log 2>&1'", MAX_SLEEP_TIME);
                         if (system(cmd) != 0)
                         {
                             dbg_printf(COLOR_RED, "S4 sleep failed\n");
                         }
-                        // if (DISK_IO_ENGINE == IO_ENGINE_USB)
-                        // {
-                        //     restore_usb_power_after_wake();
-                        // }
+                        if (DISK_IO_ENGINE == IO_ENGINE_USB)
+                        {
+                            restore_usb_power_after_wake();
+                        }
                         break;
 
                     case SLEEP_MODE_BOTH:
                         // Alternate between S3 and S4
-                        // if (DISK_IO_ENGINE == IO_ENGINE_USB)
-                        // {
-                        //     configure_usb_power_for_sleep();
-                        // }
+                        if (DISK_IO_ENGINE == IO_ENGINE_USB)
+                        {
+                            configure_usb_power_for_sleep();
+                        }
                         if (gDiskIOInfo.current_sleep == SLEEP_MODE_S3)
                         {
                             sprintf(cmd, "sudo sh -c 'rtcwake -m mem -s %d > rtc.log 2>&1'", MAX_SLEEP_TIME);
@@ -1307,10 +1298,10 @@ void* rtc_thread_handler(void *data)
                             }
                             gDiskIOInfo.current_sleep = SLEEP_MODE_S3; // Switch to S3 next time
                         }
-                        // if (DISK_IO_ENGINE == IO_ENGINE_USB)
-                        // {
-                        //     restore_usb_power_after_wake();
-                        // }
+                        if (DISK_IO_ENGINE == IO_ENGINE_USB)
+                        {
+                            restore_usb_power_after_wake();
+                        }
                         break;
 
                     default:
@@ -1954,10 +1945,6 @@ int thread_read(ThreadInfo_t* pThrInfo, U64 lba, U32 len)
             pthread_mutex_unlock(&mutex_msg);
 
             dump_compare_error_buffer(pThrInfo, pThrInfo->bufR, pThrInfo->bufW, lba);
-        }
-        else
-        {
-            dbg_printf(COLOR_GREEN, "Loop[%d] Thread[%3d] LBA[%08llX] Len[%03X] RE-READ PASS\n", pThrInfo->cr_loop, pThrInfo->id, lba, len);
         }
     #endif
 
@@ -2992,6 +2979,10 @@ int command_parser(int argc, char** argv)
 
         pFunc(argv[1], argc - 3, (char**)&argv[3]);
     }
+    else
+    {
+        printf("pFunc == null\n");
+    }
 
     return 0;
 }
@@ -3704,7 +3695,7 @@ int configure_usb_power_for_sleep(void)
     success_count = 0;
     total_count = 0;
 
-    // dbg_printf(COLOR_CYAN, "Configuring USB power management for sleep...\n");
+    dbg_printf(COLOR_CYAN, "Configuring USB power management for sleep...\n");
 
     // Log power status before sleep
     log_usb_power_status("before_sleep");
@@ -3719,15 +3710,11 @@ int configure_usb_power_for_sleep(void)
             path[strcspn(path, "\n")] = '\0';
             total_count++;
 
-            // Use write_to_sysfs_file instead of system() for better error handling
-            if (write_to_sysfs_file(path, "disabled") == 0)
+            sprintf(cmd, "sudo sh -c 'echo \"disabled\" > \"%s\" 2>/dev/null'", path);
+            if (system(cmd) == 0)
             {
                 success_count++;
                 dbg_printf(COLOR_GREEN, "Disabled wake: %s\n", path);
-            }
-            else
-            {
-                dbg_printf(COLOR_YELLOW, "Failed to disable wake: %s\n", path);
             }
         }
         pclose(fp);
@@ -3742,14 +3729,11 @@ int configure_usb_power_for_sleep(void)
             path[strcspn(path, "\n")] = '\0';
             total_count++;
 
-            if (write_to_sysfs_file(path, "auto") == 0)
+            sprintf(cmd, "sudo sh -c 'echo \"auto\" > \"%s\" 2>/dev/null'", path);
+            if (system(cmd) == 0)
             {
                 success_count++;
                 dbg_printf(COLOR_GREEN, "Set auto suspend: %s\n", path);
-            }
-            else
-            {
-                dbg_printf(COLOR_YELLOW, "Failed to set auto suspend: %s\n", path);
             }
         }
         pclose(fp);
@@ -3764,88 +3748,34 @@ int configure_usb_power_for_sleep(void)
             path[strcspn(path, "\n")] = '\0';
             total_count++;
 
-            if (write_to_sysfs_file(path, "1") == 0)
+            sprintf(cmd, "sudo sh -c 'echo \"1\" > \"%s\" 2>/dev/null'", path);
+            if (system(cmd) == 0)
             {
                 success_count++;
                 dbg_printf(COLOR_GREEN, "Set suspend timeout: %s\n", path);
-            }
-            else
-            {
-                dbg_printf(COLOR_YELLOW, "Failed to set suspend timeout: %s\n", path);
             }
         }
         pclose(fp);
     }
 
     // 4. Configure USB controller power management
-    fp = popen("find /sys/bus/pci/devices -name 'control' -path '*/power/control' 2>/dev/null", "r");
-    if (fp != NULL)
-    {
-        while (fgets(path, sizeof(path), fp) != NULL)
-        {
-            path[strcspn(path, "\n")] = '\0';
-
-            // Check if this is a USB controller (Class 0x0c03xx)
-            char class_path[520];  // Increase buffer size to accommodate additional "/class" string
-            char device_dir[512];
-            FILE* class_fp;
-            char class_value[16];
-
-            // Extract device directory from control path
-            strncpy(device_dir, path, sizeof(device_dir) - 1);
-            device_dir[sizeof(device_dir) - 1] = '\0';
-
-            char* last_slash = strrchr(device_dir, '/');
-            if (last_slash != NULL)
-            {
-                *last_slash = '\0';
-
-                // Use safer string combination method
-                int ret = snprintf(class_path, sizeof(class_path), "%s/class", device_dir);
-                if (ret >= sizeof(class_path))
-                {
-                    // Path too long, skip this item
-                    continue;
-                }
-
-                class_fp = fopen(class_path, "r");
-                if (class_fp != NULL)
-                {
-                    if (fgets(class_value, sizeof(class_value), class_fp) != NULL)
-                    {
-                        // Check if it's a USB controller (class 0x0c03xx)
-                        if (strncmp(class_value, "0x0c03", 6) == 0)
-                        {
-                            total_count++;
-                            if (write_to_sysfs_file(path, "auto") == 0)
-                            {
-                                success_count++;
-                                dbg_printf(COLOR_GREEN, "Set USB controller auto: %s\n", path);
-                            }
-                            else
-                            {
-                                dbg_printf(COLOR_YELLOW, "Failed to set USB controller auto: %s\n", path);
-                            }
-                        }
-                    }
-                    fclose(class_fp);
-                }
-            }
-        }
-        pclose(fp);
-    }
-
-    // 5. Set USB core module parameters (this doesn't count towards success/total)
+    system("for controller in /sys/bus/pci/devices/*/power/control; do "
+           "if [ -f \"$controller\" ]; then "
+           "device_path=$(dirname \"$controller\"); "
+           "if [ -f \"$device_path/class\" ]; then "
+           "device_class=$(cat \"$device_path/class\" 2>/dev/null); "
+           "if echo \"$device_class\" | grep -q '^0x0c03'; then "
+           "echo 'auto' > \"$controller\" 2>/dev/null; "
+           "fi; fi; fi; done");    // 5. Set USB core module parameters
     system("sudo sh -c 'echo \"options usbcore autosuspend=1\" > /etc/modprobe.d/usb-power-save.conf 2>/dev/null'");
 
-    // dbg_printf(COLOR_GREEN, "USB power management configured successfully (%d/%d)\n", success_count, total_count);
-
+    dbg_printf(COLOR_GREEN, "USB power management configured successfully (%d/%d)\n", success_count, total_count);
     return 0;
 }
 
 int restore_usb_power_after_wake(void)
 {
-    // dbg_printf(COLOR_CYAN, "Restoring USB power settings after wake...\n");
+    dbg_printf(COLOR_CYAN, "Restoring USB power settings after wake...\n");
 
     // Log power status after wake
     log_usb_power_status("after_wake");
